@@ -15,6 +15,8 @@
 #include "ninfer/ops/gdn_gating.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/gqa_attention.h"
+#include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
@@ -42,6 +44,19 @@
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
+
+namespace {
+
+// A d256 paged KV cache is either a code layout (page dtypes match the logical dtype) or a local
+// codec layout (U8 packed/rotated/E8 planes under an INT8-G64 logical dtype). Only the layout-aware
+// GQA A1/A2/A3 Op family serves the latter; the softmax_attention family requires the code layout.
+template <class View>
+bool kv_layout_packed(const View& view) {
+    return view.packed_v || view.packed_k || view.rotate_k || view.rotate_v || view.e8_lattice ||
+           view.e8_root;
+}
+
+} // namespace
 namespace {
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
@@ -396,14 +411,32 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Tensor v_batch        = v.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = positions.view({width, active_sequence_batch_});
-        ops::causal_softmax_attention(
-            q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
-            *active_backend_kv_table_rows_, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
-            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
+        const auto mtp_view = batch_mtp_kv_->batch_layer_view(0);
+        if (kv_layout_packed(mtp_view)) {
+            const ops::GqaExecutionEnvelope gqa_envelope{envelope.min_visible_keys,
+                                                         envelope.max_visible_keys};
+            ops::gqa_attention(q_batch, k_batch, v_batch, position_batch,
+                               *active_valid_columns_, *active_backend_kv_table_rows_, kAttnScale,
+                               mtp_view, gqa_envelope, work_, a_batch, s);
+        } else {
+            ops::causal_softmax_attention(
+                q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
+                *active_backend_kv_table_rows_, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
+                mtp_view, envelope, work_, a_batch, s);
+        }
     } else {
-        ops::causal_softmax_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
-                                      {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
-                                      batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
+        const auto mtp_view = batch_mtp_kv_->batch_layer_view(0);
+        if (kv_layout_packed(mtp_view)) {
+            const ops::GqaExecutionEnvelope gqa_envelope{envelope.min_visible_keys,
+                                                         envelope.max_visible_keys};
+            ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
+                               kAttnScale, mtp_view, gqa_envelope, work_, a, s);
+        } else {
+            ops::causal_softmax_attention(qn, kn, v, positions, Tensor{},
+                                          io_.backend_kv_table_row,
+                                          {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale, mtp_view,
+                                          envelope, work_, a, s);
+        }
     }
     ops::sigmoid_mul(gate, a, s);
 
@@ -491,7 +524,12 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
         ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
         ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
-        ops::kv_cache_append(kn, v, positions, mtp_kv_.layer_view(0), s);
+        const auto mtp_layer_view = mtp_kv_.layer_view(0);
+        if (kv_layout_packed(mtp_layer_view)) {
+            ops::gqa_kv_append(kn, v, positions, mtp_layer_view, s);
+        } else {
+            ops::kv_cache_append(kn, v, positions, mtp_layer_view, s);
+        }
 
         if (final_chunk) {
             const std::size_t column_bytes =
@@ -533,9 +571,17 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rope(last_rope_position, kCfg.rotary_dim, kCfg.rope_theta, qn, s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
-        ops::causal_softmax_attention_cached(qn, last_position,
-                                             {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
-                                             mtp_kv_.layer_view(0), envelope, work_, a, s);
+        const auto mtp_layer_view = mtp_kv_.layer_view(0);
+        if (kv_layout_packed(mtp_layer_view)) {
+            const ops::GqaExecutionEnvelope gqa_envelope{envelope.min_visible_keys,
+                                                         envelope.max_visible_keys};
+            ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_layer_view, gqa_envelope,
+                                      work_, a, s);
+        } else {
+            ops::causal_softmax_attention_cached(qn, last_position,
+                                                 {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
+                                                 mtp_layer_view, envelope, work_, a, s);
+        }
         ops::sigmoid_mul(gate, a, s);
 
         Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, 1});
@@ -857,15 +903,35 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
-        ops::causal_softmax_attention(q_batch, k_batch, v_batch, position_batch, valid,
-                                      kv_table_rows, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv},
-                                      kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                                      *active_causal_attention_envelope_, work_, a_batch, s);
+        const auto text_view = batch_text_kv_->batch_layer_view(fidx);
+        if (kv_layout_packed(text_view)) {
+            const ops::CausalAttentionExecutionEnvelope& envelope =
+                *active_causal_attention_envelope_;
+            const ops::GqaExecutionEnvelope gqa_envelope{envelope.min_visible_keys,
+                                                         envelope.max_visible_keys};
+            ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
+                               kAttnScale, text_view, gqa_envelope, work_, a_batch, s);
+        } else {
+            ops::causal_softmax_attention(q_batch, k_batch, v_batch, position_batch, valid,
+                                          kv_table_rows, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv},
+                                          kAttnScale, text_view,
+                                          *active_causal_attention_envelope_, work_, a_batch, s);
+        }
     } else {
-        ops::causal_softmax_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
-                                      {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
-                                      batch_text_kv_->batch_layer_view(fidx),
-                                      *active_causal_attention_envelope_, work_, a, s);
+        const auto text_view = batch_text_kv_->batch_layer_view(fidx);
+        if (kv_layout_packed(text_view)) {
+            const ops::CausalAttentionExecutionEnvelope& envelope =
+                *active_causal_attention_envelope_;
+            const ops::GqaExecutionEnvelope gqa_envelope{envelope.min_visible_keys,
+                                                         envelope.max_visible_keys};
+            ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
+                               text_view, gqa_envelope, work_, a, s);
+        } else {
+            ops::causal_softmax_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
+                                          {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
+                                          text_view, *active_causal_attention_envelope_, work_, a,
+                                          s);
+        }
     }
     ops::sigmoid_mul(gate, a, s);
 
@@ -993,6 +1059,10 @@ template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+        // [2n] DFlash feature tap: reference t_layer_inp[L] is the residual
+        // stream ENTERING layer L (assigned at the top of the reference loop),
+        // not the output of layer L. Capture here so capture_layer(L,x) matches.
+        if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
@@ -1012,7 +1082,6 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
                 mlp_tail(full.post_attn_norm, full.mlp, x, ph);
-                if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         } else {
             const int gidx       = ModelConfig::gdn_idx(layer);
@@ -1033,7 +1102,6 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
                 mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
-                if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         }
     }

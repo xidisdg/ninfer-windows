@@ -25,7 +25,7 @@ struct OpenAIChatRequest {
 
 OpenAIChatRequest parse_chat_completion_request(const nlohmann::json& body,
                                                 const RequestLimits& limits,
-                                                const std::string& default_model);
+                                                const std::string& default_model = {});
 
 struct OpenAIChatResponseIdentity {
     std::string id;

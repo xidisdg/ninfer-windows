@@ -12,12 +12,8 @@
 #include <system_error>
 #include <utility>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <intrin.h>
-#include <windows.h>
+#if defined(_WIN32)
+#include <process.h>
 #else
 #include <unistd.h>
 #endif
@@ -31,20 +27,9 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults();
 namespace {
 
 using Json = nlohmann::json;
-#if defined(__SIZEOF_INT128__)
-using U128 = unsigned __int128;
-#endif
 
 constexpr std::size_t direction_index(ContextTransferDirection direction) noexcept {
     return static_cast<std::size_t>(direction);
-}
-
-std::uint64_t process_id() noexcept {
-#ifdef _WIN32
-    return static_cast<std::uint64_t>(::GetCurrentProcessId());
-#else
-    return static_cast<std::uint64_t>(::getpid());
-#endif
 }
 
 std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) noexcept {
@@ -54,40 +39,31 @@ std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) noexcept {
 }
 
 std::uint64_t saturating_product(std::uint64_t left, std::uint64_t right) noexcept {
-#if defined(__SIZEOF_INT128__)
-    const U128 product = static_cast<U128>(left) * right;
-    return product > std::numeric_limits<std::uint64_t>::max()
-               ? std::numeric_limits<std::uint64_t>::max()
-               : static_cast<std::uint64_t>(product);
-#else
-    return right != 0 && left > std::numeric_limits<std::uint64_t>::max() / right
-               ? std::numeric_limits<std::uint64_t>::max()
-               : left * right;
-#endif
+    const std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+    return left != 0 && right > kMax / left ? kMax : left * right;
 }
 
 std::uint64_t q32_product_ns(std::uint64_t coefficient, std::uint64_t units) noexcept {
     if (coefficient == 0 || units == 0) { return 0; }
-#if defined(__SIZEOF_INT128__)
-    const U128 product        = static_cast<U128>(coefficient) * units;
-    const U128 maximum_scaled = static_cast<U128>(std::numeric_limits<std::uint64_t>::max()) << 32U;
-    if (product >= maximum_scaled) { return std::numeric_limits<std::uint64_t>::max(); }
-    return static_cast<std::uint64_t>((product + kContextCostQ32One - 1U) >> 32U);
-#else
-    // MSVC x64: _umul128 returns the low 64 bits of the 128-bit product and
-    // stores the high 64 bits in *hi. Reconstruct, saturate, then ceil-divide
-    // by 2^32 (equivalence verified by fuzz_u128.py; the saturation check
-    // guarantees the final sum stays <= u64max).
-    std::uint64_t hi = 0;
-    const std::uint64_t lo = _umul128(coefficient, units, &hi);
-    constexpr std::uint64_t kSatHi = 0xFFFFFFFFULL;
-    constexpr std::uint64_t kSatLo = 0xFFFFFFFF00000000ULL;
-    if (hi > kSatHi || (hi == kSatHi && lo >= kSatLo)) {
-        return std::numeric_limits<std::uint64_t>::max();
-    }
-    const std::uint64_t shifted = (hi << 32U) | (lo >> 32U);
-    return shifted + ((lo & 0xFFFFFFFFULL) ? 1U : 0U);
-#endif
+    // (coefficient * units + 2^32 - 1) >> 32, saturated to uint64, without 128-bit types.
+    // product = a1*b1*2^64 + (a1*b0 + a0*b1)*2^32 + a0*b0; result is the ceiling of product/2^32.
+    const std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t a1 = coefficient >> 32;
+    const std::uint64_t a0 = coefficient & 0xFFFFFFFFU;
+    const std::uint64_t b1 = units >> 32;
+    const std::uint64_t b0 = units & 0xFFFFFFFFU;
+    const std::uint64_t ceil_lo = (a0 * b0 + 0xFFFFFFFFU) >> 32;
+    const std::uint64_t h1 = a1 * b1;
+    if (h1 >= 0x100000000U) { return kMax; }
+    const std::uint64_t m1 = a1 * b0;
+    const std::uint64_t m2 = a0 * b1;
+    if (m2 > kMax - m1) { return kMax; }
+    const std::uint64_t mid = m1 + m2;
+    if (ceil_lo > kMax - mid) { return kMax; }
+    const std::uint64_t t = mid + ceil_lo;
+    const std::uint64_t high = h1 << 32;
+    if (t > kMax - high) { return kMax; }
+    return high + t;
 }
 
 void require_object(const Json& value, std::string_view context) {
@@ -336,7 +312,7 @@ void write_document_atomic(const std::filesystem::path& path, const Json& docume
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
 
     std::filesystem::path temporary = path;
-    temporary += ".tmp." + std::to_string(static_cast<long long>(process_id())) + "." +
+    temporary += ".tmp." + std::to_string(static_cast<long long>(::getpid())) + "." +
                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     try {
         {

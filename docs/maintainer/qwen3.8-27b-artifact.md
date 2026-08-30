@@ -4,6 +4,7 @@ This reference defines the `qwen3.8-27b/nvfp4` `.ninfer` storage contract: ident
 inventory, shapes, numeric formats, storage layouts, fused row order, aliases, fixed sources, and
 source-to-object transforms. The existing registered `qwen3.8-27b/groupwise-int` contract remains
 defined in Section 13.
+The registered `qwen3.8-27b/groupwise-int-dflash2` profile (a `groupwise-int` base plus the DFlash2 drafter, defined in Section 14) is the second registered groupwise peer.
 
 The NVFP4 profile is a registered Engine identity implemented by the target converter, exact
 binder, and Qwen3.8 execution leaves. The generic artifact registry resolves its version-2
@@ -751,3 +752,109 @@ python3 -m tools.convert.qwen3_8_27b.convert \
 The converter validates the official checkpoint, frontend resources, complete object plan, and
 numeric recipes before opening the output, then writes the sibling
 `qwen3_8_27b.ninfer.conversion.json` report.
+
+
+## 14. `groupwise-int-dflash2` artifact
+
+The DFlash2 peer is the `groupwise-int` base (Section 13) plus a `dflash2/` drafter
+component. It retains the `groupwise-int` Text, optimized MTP draft head, MTP, and Vision
+inventories unchanged and adds the DFlash2 block-diffusion drafter objects.
+
+```text
+filename   = qwen3_8_27b_groupwise-int-dflash2.ninfer
+model_id   = qwen3.8-27b
+weights_id = groupwise-int-dflash2
+target_key = qwen3_8_27b
+recipe_id  = qwen3_8_27b_groupwise-int-dflash2-v1
+```
+
+The artifact is one complete image: the Section 13 base objects plus the DFlash2 drafter and the
+same six frontend resources. It binds through the `Qwen38GroupwiseIntDflash2` profile.
+
+### 14.1 Object counts and format totals
+
+| Measure | Value |
+|---|---:|
+| objects | 1190 (1184 tensors + 6 resources) |
+| tensor bytes | 20242434464 |
+| artifact bytes | 20255474176 |
+| `MAXABS_F16_RECIP_RNE_V1` encoder | all groupwise integer tensors |
+
+Combined numeric-format counts:
+
+| Format | Tensors |
+|---|---:|
+| `BF16` | 614 |
+| `FP32` | 96 |
+| `I32` | 1 |
+| `Q4G64_F16S` | 183 |
+| `Q5G64_F16S` | 246 |
+| `Q6G64_F16S` | 1 |
+| `W8G32_F16S` | 43 |
+
+The base (Section 13) contributes `W8G32_F16S` = 9 and `BF16` = 582; the DFlash2 drafter adds 34
+W8 tensors and 32 BF16 tensors (the `W8G32_F16S` total of 43 and `BF16` of 614 reflect both).
+
+### 14.2 DFlash2 drafter geometry
+
+The drafter is produced from `z-lab/Qwen3.8-27B-DFlash2` (single `model.safetensors`, all BF16,
+81 tensors, 66 converter recipes). Its component tensor bytes total 2044930560 after W8
+quantization.
+
+| Fact | Value |
+|---|---:|
+| drafter layers (all sliding-window) | 5 |
+| hidden width | 5120 |
+| MLP intermediate width | 17408 |
+| query / KV heads / head width | 32 / 8 / 128 |
+| query / KV widths | 4096 / 1024 |
+| sliding-window capacity | 2048 |
+| `fc` feature input rows (5 x 5120) | 25600 |
+| target feature layer ids | 5, 19, 33, 47, 61 |
+| `block_size` / draft tokens per step | 8 / 7 |
+| `mask_token_id` | 248070 (existing row, alias-only) |
+| two-tap dynamic conv: kernel / group / projection rows | 2 / 16 / 1280 |
+| selector rank / top-k / codebook rows | 256 / 16 / 248320 |
+
+Per drafter layer the objects are `input_norm [5120]`, `attention/query_key_value [6144,5120]`,
+`attention/query_norm [128]`, `attention/key_norm [128]`, `attention/output [5120,4096]`,
+`attention/attention_conv_base [2,2,5120]`, `attention/attention_conv_projection [1280,5120]`,
+`post_attention_norm [5120]`, `mlp/gate_up [34816,5120]`, `mlp/down [5120,17408]`,
+`mlp/mlp_conv_base [2,2,5120]`, and `mlp/mlp_conv_projection [1280,5120]`; plus the globals
+`dflash2/feature_projection [5120,25600]`, `dflash2/context_norm [5120]`, `dflash2/final_norm
+[5120]`, and the three selector objects
+(`dflash2/selector_predecessor_codebook [248320,256]`,
+`dflash2/selector_successor_codebook [248320,256]`, `dflash2/selector_hidden_projection
+[256,5120]`). The large projection matrices use `W8G32_F16S` (`row-split-k128-v1`); the
+convolution base kernels and norms use BF16.
+
+The drafter reuses the target `text/output_head` by alias (it has no private output head) and the
+target `text/token_embedding` for the mask-token row. Unlike the 35B DFlash v1 drafter, all five
+layers are sliding-window (no full-context layer) and each runs two-tap dynamic convolutions plus
+a top-16 candidate selector lattice.
+
+### 14.3 Conversion and runtime status
+
+The canonical conversion entry point is:
+
+```bash
+python3 -m tools.convert.qwen3_8_27b.convert_dflash2 \
+  --model /path/to/Qwen3.8-27B \
+  --dflash2-model /path/to/Qwen3.8-27B-DFlash2 \
+  --out out/qwen3_8_27b_groupwise-int-dflash2.ninfer \
+  --device cuda
+```
+
+The base source must be the official pinned revision (Section 10.1); the DFlash2 draft model comes
+from `z-lab/Qwen3.8-27B-DFlash2`. The converter validates both checkpoints, the pinned frontend
+resources, the complete object plan, and the numeric recipes before writing, then writes the
+sibling `qwen3_8_27b_groupwise-int-dflash2.ninfer.conversion.json` report.
+
+The target loads this artifact through the `Qwen38GroupwiseIntDflash2` weights profile and
+binds the `dflash2/` component. The DFlash2 decode and verify runtime is live: the two-tap
+dynamic convolutions, the all-sliding-window draft attention (window 2048), the on-device
+candidate selector lattice build, and the host lattice path trace run in the v2 decode round
+(eager, no CUDA graph capture). `--spec dflash` accepts a draft window in [1, 7] for this
+target (block size 8); larger windows are rejected at startup.
+
+See [`dflash2-qwen3.8-27b-notes.md`](dflash2-qwen3.8-27b-notes.md).

@@ -29,6 +29,10 @@ inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
+    RotatedInt8KeyInt4ValueGroup64,
+    RotatedInt4KeyInt4ValueGroup64,
+    RK4V4E8,
+    RK2V4E8,
     Fp8E4M3Row256,
 };
 

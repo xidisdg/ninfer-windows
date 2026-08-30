@@ -726,8 +726,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       kv_packed_v(plan.kv_packed_v), kv_rotate_k(plan.kv_rotate_k), kv_rotate_v(plan.kv_rotate_v),
       kv_packed_k(plan.kv_packed_k), kv_e8_lattice(plan.kv_e8_lattice), kv_e8_root(plan.kv_e8_root),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
-      use_cuda_graph(plan.use_cuda_graph),
-      kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
@@ -9420,6 +9419,15 @@ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint
     }
     text_kv_addresses->materialize_to_tokens(sequence.kv->text, main_tokens, device.stream);
     if (backend_tokens != 0) {
+        // Keep the all-local v2 drafter's structural `dflash.full` stub at its mapped
+        // extent (see materialize_sequence_kv); never let a frontier/extent materialize
+        // overshoot the stub's reserved structural page.
+        if (sequence.kv->backend.has_value() &&
+            speculative_backend == SpeculativeBackend::DFlash && DFlashConfig::full_layers == 0) {
+            backend_tokens = std::min(
+                backend_tokens,
+                text_kv_addresses->mapped_pages(*sequence.kv->backend) * kPagedKVPageSize);
+        }
         backend_kv_addresses->materialize_to_tokens(*sequence.kv->backend, backend_tokens,
                                                     device.stream);
     }
@@ -9447,7 +9455,16 @@ void ProgramImplCore::trim_sequence_kv(SequenceState& sequence, std::uint32_t ma
     }
     text_kv_addresses->destructive_truncate(sequence.kv->text, main_tokens);
     if (sequence.kv->backend) {
-        backend_kv_addresses->destructive_truncate(*sequence.kv->backend, backend_tokens);
+        // Keep the all-local v2 drafter's structural `dflash.full` stub at its mapped
+        // extent (see materialize_sequence_kv); never let a frontier/extent trim release
+        // the stub's reserved structural page.
+        std::uint32_t backend_trim = backend_tokens;
+        if (speculative_backend == SpeculativeBackend::DFlash && DFlashConfig::full_layers == 0) {
+            backend_trim = std::min(
+                backend_trim,
+                text_kv_addresses->mapped_pages(*sequence.kv->backend) * kPagedKVPageSize);
+        }
+        backend_kv_addresses->destructive_truncate(*sequence.kv->backend, backend_trim);
     }
 }
 
@@ -10816,7 +10833,15 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
         out.kv_cache = KvCacheStorage::BFloat16;
         break;
     case DType::I8:
-        out.kv_cache = KvCacheStorage::Int8Group64;
+        out.kv_cache = kv_e8_root
+                           ? KvCacheStorage::RK2V4E8
+                           : (kv_e8_lattice
+                                   ? KvCacheStorage::RK4V4E8
+                                   : (kv_packed_k
+                                          ? KvCacheStorage::RotatedInt4KeyInt4ValueGroup64
+                                          : (kv_rotate_v
+                                                 ? KvCacheStorage::RotatedInt8KeyInt4ValueGroup64
+                                                 : KvCacheStorage::Int8Group64)));
         break;
     case DType::FP8_E4M3FN:
         out.kv_cache = KvCacheStorage::Fp8E4M3Row256;

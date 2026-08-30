@@ -267,7 +267,10 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
         base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+        base->backend_kv_page_entitlement =
+            DFlashConfig::full_layers == 0
+                ? 1U  // all-local v2 drafter: one-page structural pool
+                : pages_for_tokens(reserved_context_tokens);
     }
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,

@@ -373,6 +373,10 @@ int test_messages_and_media() {
                           tool_image.messages.back().content[1].kind == ContentKind::Image,
                       "tool result text and image parts normalize to one tool turn");
 
+    body["messages"].back()["name"] = "capture";
+    failures += check(parse(body).generation.messages.back().role == ninfer::ChatRole::Tool,
+                      "tool message name is accepted as OpenAI-compatible redundant identity");
+
     body["messages"].back()["content"] = Json::array(
         {Json{{"type", "video_url"}, {"video_url", "https://example.test/capture.mp4"}}});
     failures += check(api_error([&] { (void)parse(body); }).code == "modality_not_supported",
@@ -389,9 +393,17 @@ int test_messages_and_media() {
                       "file input rejected");
 
     body                        = base_request();
-    body["messages"][0]["name"] = "speaker";
-    failures += check(api_error([&] { (void)parse(body); }).code == "message_name_not_supported",
-                      "message name rejected");
+    body["messages"][0]["name"] = "cursor";
+    const GenerationRequest named_user = parse(body).generation;
+    failures += check(named_user.messages.size() == 1 &&
+                          named_user.messages[0].role == ninfer::ChatRole::User &&
+                          named_user.messages[0].content[0].text == "hello",
+                      "ordinary message name is accepted and ignored");
+
+    body                        = base_request();
+    body["messages"][0]["name"] = 7;
+    failures += check(api_error([&] { (void)parse(body); }).message == "message name must be a string",
+                      "message name type remains validated");
 
     body                           = base_request();
     body["messages"][0]["name"]    = "";
@@ -639,6 +651,28 @@ int test_common_objects() {
     return failures;
 }
 
+int test_default_model_fallback() {
+    int failures = 0;
+    Json body = base_request();
+    body.erase("model");
+    const OpenAIChatRequest filled = parse_chat_completion_request(body, limits(), "qwen");
+    failures += check(filled.model == "qwen", "omitted model falls back to the public model id");
+    Json empty_body = body;
+    empty_body["model"] = "";
+    const OpenAIChatRequest empty_model = parse_chat_completion_request(empty_body, limits(), "qwen");
+    failures += check(empty_model.model == "qwen",
+                      "empty model falls back to the public model id");
+    Json other = base_request();
+    other["model"] = "other";
+    const OpenAIChatRequest explicit_model = parse_chat_completion_request(other, limits(), "qwen");
+    failures += check(explicit_model.model == "other", "explicit model wins over the fallback");
+    const ApiError error =
+        api_error([&] { (void)parse_chat_completion_request(body, limits()); });
+    failures += check(error.status == 400 && error.message == "missing required field: model",
+                      "missing model without a fallback is still a 400");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -653,6 +687,7 @@ int main() {
     failures += test_aggregate_response();
     failures += test_stream_response();
     failures += test_common_objects();
+    failures += test_default_model_fallback();
     if (failures == 0) { std::cout << "OpenAI Chat protocol tests passed\n"; }
     return failures == 0 ? 0 : 1;
 }

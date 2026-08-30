@@ -31,8 +31,12 @@ struct Variant;
 enum class WeightsProfile : std::uint8_t {
     Qwen36GroupwiseInt,
     Qwen38GroupwiseInt,
+    Qwen38GroupwiseIntDflash2,
     Qwen36Nvfp4,
     Qwen38Nvfp4,
+    Qwen38Nvfp4Full,
+    Qwen38Nvfp4Dflash2,
+    Qwen38Nvfp4FullDflash2,
 };
 
 using Frontend        = qwen3_6::Frontend;

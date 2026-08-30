@@ -17,14 +17,20 @@ SequencePlan<Variant>::SequencePlan(
     std::unique_ptr<detail::SequencePlanImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 
+// Explicit bodies instead of `= default`: MSVC 19.44 does not emit out-of-line `= default`
+// explicit specializations of these moves (LNK2019 for the plan moves at the final Windows
+// link), while out-of-line specializations with bodies link fine. The bodies are exactly what
+// `= default` would generate: a move of the unique_ptr impl member.
 template <>
 SequencePlan<Variant>::SequencePlan(SequencePlan&& other) noexcept
     : impl_(std::move(other.impl_)) {}
+
 template <>
 SequencePlan<Variant>& SequencePlan<Variant>::operator=(SequencePlan&& other) noexcept {
     impl_ = std::move(other.impl_);
     return *this;
 }
+
 template <>
 SequencePlan<Variant>::~SequencePlan() = default;
 
@@ -61,11 +67,13 @@ SequencePlanner<Variant>::SequencePlanner(
 template <>
 SequencePlanner<Variant>::SequencePlanner(SequencePlanner&& other) noexcept
     : impl_(std::move(other.impl_)) {}
+
 template <>
 SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&& other) noexcept {
     impl_ = std::move(other.impl_);
     return *this;
 }
+
 template <>
 SequencePlanner<Variant>::~SequencePlanner() = default;
 
@@ -90,11 +98,13 @@ RequestBasePlan<Variant>::RequestBasePlan(
 template <>
 RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&& other) noexcept
     : impl_(std::move(other.impl_)) {}
+
 template <>
 RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&& other) noexcept {
     impl_ = std::move(other.impl_);
     return *this;
 }
+
 template <>
 RequestBasePlan<Variant>::~RequestBasePlan() = default;
 
@@ -128,17 +138,12 @@ PressurePlanningSession<Variant>::PressurePlanningSession(
     std::unique_ptr<detail::PressurePlanningSessionImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 
-template <>
-PressurePlanningSession<Variant>::PressurePlanningSession(
-    PressurePlanningSession&& other) noexcept
-    : impl_(std::move(other.impl_)) {}
+PressurePlanningSession<Variant>::PressurePlanningSession(PressurePlanningSession&&) noexcept =
+    default;
 
 template <>
 PressurePlanningSession<Variant>&
-PressurePlanningSession<Variant>::operator=(PressurePlanningSession&& other) noexcept {
-    impl_ = std::move(other.impl_);
-    return *this;
-}
+PressurePlanningSession<Variant>::operator=(PressurePlanningSession&&) noexcept = default;
 
 template <>
 PressurePlanningSession<Variant>::~PressurePlanningSession() = default;

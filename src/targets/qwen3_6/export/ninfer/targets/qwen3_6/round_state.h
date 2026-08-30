@@ -79,6 +79,7 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> dflash_kv_table_rows{};
+    std::array<std::int32_t, kMaximumConcurrency> lanes{};
     std::array<std::int32_t, kMaximumConcurrency> active_lanes{};
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
@@ -256,6 +257,7 @@ struct DFlashDecodeState {
     Tensor target_valid_columns;
     Tensor text_kv_table_rows;
     Tensor dflash_kv_table_rows;
+    Tensor lanes;
     Tensor active_lanes;
     Tensor state_source_slots;
     Tensor state_destination_slots;

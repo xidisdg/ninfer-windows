@@ -92,8 +92,20 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen36Nvfp4;
     }
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "groupwise-int-dflash2") {
+        return WeightsProfile::Qwen38GroupwiseIntDflash2;
+    }
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen38Nvfp4;
+    }
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4full") {
+        return WeightsProfile::Qwen38Nvfp4Full;
+    }
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4-dflash2") {
+        return WeightsProfile::Qwen38Nvfp4Dflash2;
+    }
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4full-dflash2") {
+        return WeightsProfile::Qwen38Nvfp4FullDflash2;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");

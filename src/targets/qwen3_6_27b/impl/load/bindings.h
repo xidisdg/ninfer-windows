@@ -1,5 +1,6 @@
 #pragma once
 
+#include "targets/qwen3_6_27b/impl/config.h"
 #include <ninfer/targets/qwen3_6_27b/package.h>
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
 #include <ninfer/targets/qwen3_6/model_view.h>
@@ -104,9 +105,38 @@ struct MtpPlan {
     artifact::ObjectHandle final_norm;
 };
 
+// DFlash2 (drafter v2) binding plan: 5 all-sliding-window layers with two-tap dynamic
+// convolutions on the attention and MLP sublayers, plus the candidate selector codebooks
+// and hidden projection. The artifact objects live under the `dflash2/` namespace.
+struct DFlash2LayerPlan {
+    artifact::ObjectHandle input_norm;
+    artifact::ObjectHandle query_key_value;
+    artifact::ObjectHandle query_norm;
+    artifact::ObjectHandle key_norm;
+    artifact::ObjectHandle attention_output;
+    artifact::ObjectHandle attention_conv_base;
+    artifact::ObjectHandle attention_conv_projection;
+    artifact::ObjectHandle post_attention_norm;
+    artifact::ObjectHandle gate_up;
+    artifact::ObjectHandle down;
+    artifact::ObjectHandle mlp_conv_base;
+    artifact::ObjectHandle mlp_conv_projection;
+};
+
+struct DFlash2Plan {
+    artifact::ObjectHandle feature_projection;
+    artifact::ObjectHandle context_norm;
+    std::array<DFlash2LayerPlan, DFlashConfig::layers> layers;
+    artifact::ObjectHandle final_norm;
+    artifact::ObjectHandle selector_predecessor_codebook;
+    artifact::ObjectHandle selector_successor_codebook;
+    artifact::ObjectHandle selector_hidden_projection;
+};
+
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
+    WeightsProfile weights_profile;
 
     WeightPlan token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
@@ -115,6 +145,7 @@ struct BindingPlan {
     artifact::ObjectHandle draft_head;
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
+    DFlash2Plan dflash;
 
     qwen3_6::VisionBackbonePlan vision_backbone;
     qwen3_6::VisionMergerInputPlan vision_merger_input;
@@ -189,11 +220,12 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<6>,
+                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlash2Weights<5>,
                        kFullAttentionLayers, kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;
+using DFlash2Weights       = RuntimeModelView::DFlash;
 
 class LoadedModelData {
 public:

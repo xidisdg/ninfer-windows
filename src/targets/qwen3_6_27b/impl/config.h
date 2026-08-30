@@ -4,6 +4,7 @@
 #include <ninfer/targets/qwen3_6/hybrid_topology.h>
 #include <ninfer/targets/qwen3_6/vision.h>
 
+#include <array>
 #include <cstdint>
 
 namespace ninfer::targets::qwen3_6_27b::detail {
@@ -70,25 +71,58 @@ struct VisionConfig : qwen3_6::VisionBackboneConfig {
     static constexpr int output_hidden = TextConfig::hidden;
 };
 
+// DFlash2 (block-diffusion drafter v2) geometry, matching the converted
+// `dflash2/` component of the Qwen3.8-27B groupwise-int-dflash2 artifact and
+// the z-lab/Qwen3.8-27B-DFlash2 checkpoint. Unlike the 35B DFlash v1 drafter,
+// all five draft layers use symmetric non-causal sliding-window attention over
+// an all-local cyclic cache (there is no full-context layer), and each layer
+// runs two-tap dynamic convolutions plus a top-16 candidate selector lattice.
 struct DFlashConfig {
-    static constexpr bool supported     = false;
-    static constexpr int local_layers   = 0;
-    static constexpr int local_capacity = 0;
-    static constexpr int query_heads    = 0;
-    static constexpr int kv_heads       = 0;
-    static constexpr int head_dim       = 0;
-    static constexpr int feature_rows   = 0;
-    static constexpr int hidden         = 0;
-    static constexpr int intermediate   = 0;
-    static constexpr int query_size     = 0;
-    static constexpr int kv_size        = 0;
+    static constexpr bool supported        = true;
+    static constexpr bool is_v2            = true;
+    static constexpr int layers            = 5;
+    static constexpr int local_layers      = 5;
+    static constexpr int full_layers       = 0;
+    static constexpr int feature_layers    = 5;
+    static constexpr int hidden            = TextConfig::hidden;
+    static constexpr int intermediate      = TextConfig::intermediate;
+    static constexpr int query_heads       = 32;
+    static constexpr int kv_heads          = 8;
+    static constexpr int head_dim          = 128;
+    static constexpr int query_size        = query_heads * head_dim;
+    static constexpr int kv_size           = kv_heads * head_dim;
+    static constexpr int local_capacity    = 2048;
+    static constexpr int feature_rows      = feature_layers * hidden;
+    static constexpr int mask_token        = 248070;
+    static constexpr float rms_epsilon     = 1.0e-6F;
+    static constexpr float rope_theta      = 1.0e7F;
+    static constexpr float attention_scale = 0.08838834764831845F;
+    static constexpr std::array<int, feature_layers> target_feature_layers{5, 19, 33, 47, 61};
+
+    // Two-tap dynamic convolution: a static base kernel plus a low-rank
+    // projection of the layer's normalized hidden state (320 groups x 2 taps x
+    // 2 sides). Applied per 16-channel group.
+    static constexpr int conv_kernel_size     = 2;
+    static constexpr int conv_group_size      = 16;
+    static constexpr int conv_projection_rows = 2 * conv_kernel_size * (hidden / conv_group_size);
+
+    // Candidate selector lattice: top-16 candidates per block position, each
+    // scored from predecessor/successor codebooks ([vocab, 256]) conditioned on
+    // a hidden projection ([256, hidden]).
+    static constexpr int selector_rank   = 256;
+    static constexpr int selector_top_k  = 16;
+    static constexpr int selector_vocab  = 248320;
+    static constexpr int block_size      = 8;
 };
+
+static_assert(DFlashConfig::feature_rows == 25600);
+static_assert(DFlashConfig::conv_projection_rows == 1280);
 
 inline constexpr float kAttentionScale                   = 0.0625F;
 inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
-inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
+inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 7;  // v2 drafter: DFlashConfig::block_size - 1 = 7 draft tokens per verify step
 inline constexpr std::uint32_t kNativeContext            = 262144;
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

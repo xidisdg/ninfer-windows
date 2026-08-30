@@ -324,6 +324,7 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     text_kv_table_rows =
         ingress_tensor(offsetof(DFlashDecodeIngress, text_kv_table_rows), DType::I32, {batch});
     dflash_kv_table_rows =
+    lanes = ingress_tensor(offsetof(DFlashDecodeIngress, lanes), DType::I32, {batch});
         ingress_tensor(offsetof(DFlashDecodeIngress, dflash_kv_table_rows), DType::I32, {batch});
     active_lanes = ingress_tensor(offsetof(DFlashDecodeIngress, active_lanes), DType::I32, {batch});
     state_source_slots =

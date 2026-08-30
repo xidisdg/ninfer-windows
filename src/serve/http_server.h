@@ -48,10 +48,6 @@ public:
 
 private:
     void register_routes();
-    void mount_webui(const std::string& webui_dir);
-    void register_webui_mime();
-    [[nodiscard]] bool webui_spa_path(const std::string& path) const;
-    [[nodiscard]] bool is_api_path(const std::string& path) const;
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
@@ -65,6 +61,13 @@ private:
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
     void handle_props(const httplib::Request& req, httplib::Response& res) const;
+
+    // Static llama.cpp webui serving: mount the prebuilt UI, keep client-side routes on the
+    // SPA shell, and load UI assets without an API key.
+    void mount_webui(const std::string& webui_dir);
+    void register_webui_mime();
+    bool webui_spa_path(const std::string& path) const;
+    bool is_api_path(const std::string& path) const;
 
     // The process-wide console logger serializes lines from request and reporter threads.
     void log_line(const std::string& line);
@@ -80,8 +83,8 @@ private:
     ServeOptions options_;
     AnthropicThinkingSigner anthropic_thinking_signer_;
     std::string public_model_id_;
-    bool webui_serving_ = false;         // true once a static webui dir is mounted
-    std::string webui_index_html_;       // cached index.html for the SPA fallback
+    bool webui_serving_ = false; // true once a static webui dir is mounted
+    std::string webui_index_html_; // cached index.html for the SPA fallback
     OpenAIResponsesStore openai_responses_store_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
