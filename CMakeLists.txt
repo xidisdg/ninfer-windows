@@ -26,9 +26,14 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
 if(MSVC)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+  # MSVC encodes narrow string literals in the locale codepage unless /utf-8 is set. The fmt
+  # bundled with spdlog static-asserts that the literal encoding is UTF-8, so pass /utf-8 to
+  # every host-compiled translation unit (and to the CUDA host passes via -Xcompiler).
   add_compile_options(
     $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+    $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
   # CUDA's static runtime requests LIBCMT even when the application and vcpkg dependencies use
   # the project-wide /MD runtime. Keep one CRT in the final process.
   add_link_options(/NODEFAULTLIB:LIBCMT)
@@ -54,7 +59,7 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
 endif()
 
 set(NINFER_BUILD_PROMPT_INPUT OFF)
-if(NINFER_BUILD_APPS)
+if(NINFER_BUILD_APPS OR BUILD_TESTING)
   set(NINFER_BUILD_PROMPT_INPUT ON)
 endif()
 
@@ -91,6 +96,12 @@ else()
   endif()
 endif()
 find_package(Threads REQUIRED)
+
+if(NINFER_BUILD_APPS OR BUILD_TESTING)
+  # Product operational logging is an offline, repository-pinned dependency. Core-only builds do
+  # not configure or link it.
+  add_subdirectory(third_party/spdlog)
+endif()
 
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)

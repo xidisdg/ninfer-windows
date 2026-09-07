@@ -12,8 +12,12 @@
 #include <system_error>
 #include <utility>
 
-#if defined(_WIN32)
-#include <process.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <intrin.h>
+#include <windows.h>
 #else
 #include <unistd.h>
 #endif
@@ -27,9 +31,20 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults();
 namespace {
 
 using Json = nlohmann::json;
+#if defined(__SIZEOF_INT128__)
+using U128 = unsigned __int128;
+#endif
 
 constexpr std::size_t direction_index(ContextTransferDirection direction) noexcept {
     return static_cast<std::size_t>(direction);
+}
+
+std::uint64_t process_id() noexcept {
+#ifdef _WIN32
+    return static_cast<std::uint64_t>(::GetCurrentProcessId());
+#else
+    return static_cast<std::uint64_t>(::getpid());
+#endif
 }
 
 std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) noexcept {
@@ -39,31 +54,40 @@ std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) noexcept {
 }
 
 std::uint64_t saturating_product(std::uint64_t left, std::uint64_t right) noexcept {
-    const std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
-    return left != 0 && right > kMax / left ? kMax : left * right;
+#if defined(__SIZEOF_INT128__)
+    const U128 product = static_cast<U128>(left) * right;
+    return product > std::numeric_limits<std::uint64_t>::max()
+               ? std::numeric_limits<std::uint64_t>::max()
+               : static_cast<std::uint64_t>(product);
+#else
+    return right != 0 && left > std::numeric_limits<std::uint64_t>::max() / right
+               ? std::numeric_limits<std::uint64_t>::max()
+               : left * right;
+#endif
 }
 
 std::uint64_t q32_product_ns(std::uint64_t coefficient, std::uint64_t units) noexcept {
     if (coefficient == 0 || units == 0) { return 0; }
-    // (coefficient * units + 2^32 - 1) >> 32, saturated to uint64, without 128-bit types.
-    // product = a1*b1*2^64 + (a1*b0 + a0*b1)*2^32 + a0*b0; result is the ceiling of product/2^32.
-    const std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
-    const std::uint64_t a1 = coefficient >> 32;
-    const std::uint64_t a0 = coefficient & 0xFFFFFFFFU;
-    const std::uint64_t b1 = units >> 32;
-    const std::uint64_t b0 = units & 0xFFFFFFFFU;
-    const std::uint64_t ceil_lo = (a0 * b0 + 0xFFFFFFFFU) >> 32;
-    const std::uint64_t h1 = a1 * b1;
-    if (h1 >= 0x100000000U) { return kMax; }
-    const std::uint64_t m1 = a1 * b0;
-    const std::uint64_t m2 = a0 * b1;
-    if (m2 > kMax - m1) { return kMax; }
-    const std::uint64_t mid = m1 + m2;
-    if (ceil_lo > kMax - mid) { return kMax; }
-    const std::uint64_t t = mid + ceil_lo;
-    const std::uint64_t high = h1 << 32;
-    if (t > kMax - high) { return kMax; }
-    return high + t;
+#if defined(__SIZEOF_INT128__)
+    const U128 product        = static_cast<U128>(coefficient) * units;
+    const U128 maximum_scaled = static_cast<U128>(std::numeric_limits<std::uint64_t>::max()) << 32U;
+    if (product >= maximum_scaled) { return std::numeric_limits<std::uint64_t>::max(); }
+    return static_cast<std::uint64_t>((product + kContextCostQ32One - 1U) >> 32U);
+#else
+    // MSVC x64: _umul128 returns the low 64 bits of the 128-bit product and
+    // stores the high 64 bits in *hi. Reconstruct, saturate, then ceil-divide
+    // by 2^32 (equivalence verified by fuzz_u128.py; the saturation check
+    // guarantees the final sum stays <= u64max).
+    std::uint64_t hi = 0;
+    const std::uint64_t lo = _umul128(coefficient, units, &hi);
+    constexpr std::uint64_t kSatHi = 0xFFFFFFFFULL;
+    constexpr std::uint64_t kSatLo = 0xFFFFFFFF00000000ULL;
+    if (hi > kSatHi || (hi == kSatHi && lo >= kSatLo)) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    const std::uint64_t shifted = (hi << 32U) | (lo >> 32U);
+    return shifted + ((lo & 0xFFFFFFFFULL) ? 1U : 0U);
+#endif
 }
 
 void require_object(const Json& value, std::string_view context) {
@@ -312,7 +336,7 @@ void write_document_atomic(const std::filesystem::path& path, const Json& docume
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
 
     std::filesystem::path temporary = path;
-    temporary += ".tmp." + std::to_string(static_cast<long long>(::getpid())) + "." +
+    temporary += ".tmp." + std::to_string(static_cast<long long>(process_id())) + "." +
                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     try {
         {
@@ -388,6 +412,92 @@ std::uint64_t ContextMachineCostModel::prefill_ns(PrefillWork work) const noexce
     result =
         saturating_add(result, q32_product_ns(prefill.vision_patch_ns_q32, work.vision_patches));
     return result;
+}
+
+PricedMaterializationMachineWork
+price_materialization_machine_work(const ContextMachineCostModel& model,
+                                   const MaterializationMachineWork& work) noexcept {
+    constexpr std::array directions{
+        ContextTransferDirection::DeviceToHost,
+        ContextTransferDirection::HostToDevice,
+        ContextTransferDirection::DeviceToDevice,
+    };
+    const auto phase_ns = [&](const CoalescedTransferWork& phase) {
+        std::uint64_t result = 0;
+        for (std::size_t index = 0; index < phase.size(); ++index) {
+            result = saturating_add(result, model.transfer_ns(directions[index], phase[index]));
+        }
+        return result;
+    };
+    const auto accumulate_shape = [](const CoalescedTransferWork& phase, std::uint64_t& bytes,
+                                     std::uint64_t& operations) {
+        for (const TransferWork item : phase) {
+            bytes      = saturating_add(bytes, item.payload_bytes);
+            operations = saturating_add(operations, item.copy_operations);
+        }
+    };
+
+    const std::uint64_t prefill_ns = model.prefill_ns(work.remaining_prefill_work);
+    PricedMaterializationMachineWork result;
+    result.optimistic_request_ns =
+        saturating_add(prefill_ns, phase_ns(work.optimistic_candidate_transfers));
+    result.immediate_ns = saturating_add(prefill_ns, phase_ns(work.pressure_transfers));
+    result.immediate_ns = saturating_add(result.immediate_ns, phase_ns(work.candidate_transfers));
+    std::uint64_t operations = 0;
+    accumulate_shape(work.pressure_transfers, result.transferred_bytes, operations);
+    accumulate_shape(work.candidate_transfers, result.transferred_bytes, operations);
+    result.copy_operations = operations > std::numeric_limits<std::uint32_t>::max()
+                                 ? std::numeric_limits<std::uint32_t>::max()
+                                 : static_cast<std::uint32_t>(operations);
+    return result;
+}
+
+std::uint64_t price_checkpoint_recovery_work(
+    const ContextMachineCostModel& model,
+    std::span<const CheckpointRecoveryAlternativeWork> alternatives) noexcept {
+    constexpr std::array directions{
+        ContextTransferDirection::DeviceToHost,
+        ContextTransferDirection::HostToDevice,
+        ContextTransferDirection::DeviceToDevice,
+    };
+    std::uint64_t best = std::numeric_limits<std::uint64_t>::max();
+    for (const CheckpointRecoveryAlternativeWork& alternative : alternatives) {
+        std::uint64_t cost = model.prefill_ns(alternative.prefill);
+        for (std::size_t index = 0; index < alternative.transfers.size(); ++index) {
+            cost = saturating_add(
+                cost, model.transfer_ns(directions[index], alternative.transfers[index]));
+        }
+        best = std::min(best, cost);
+    }
+    return best;
+}
+
+std::uint64_t price_context_transfer_requirements(
+    const ContextMachineCostModel& model,
+    std::span<const ContextTransferRequirement> requirements) noexcept {
+    CoalescedTransferWork coalesced{};
+    for (const ContextTransferRequirement& requirement : requirements) {
+        const std::size_t index = direction_index(requirement.direction);
+        if (index >= coalesced.size()) { return std::numeric_limits<std::uint64_t>::max(); }
+        coalesced[index].payload_bytes =
+            saturating_add(coalesced[index].payload_bytes, requirement.work.payload_bytes);
+        const std::uint64_t operations =
+            static_cast<std::uint64_t>(coalesced[index].copy_operations) +
+            requirement.work.copy_operations;
+        coalesced[index].copy_operations = operations > std::numeric_limits<std::uint32_t>::max()
+                                               ? std::numeric_limits<std::uint32_t>::max()
+                                               : static_cast<std::uint32_t>(operations);
+    }
+    constexpr std::array directions{
+        ContextTransferDirection::DeviceToHost,
+        ContextTransferDirection::HostToDevice,
+        ContextTransferDirection::DeviceToDevice,
+    };
+    std::uint64_t total = 0;
+    for (std::size_t index = 0; index < coalesced.size(); ++index) {
+        total = saturating_add(total, model.transfer_ns(directions[index], coalesced[index]));
+    }
+    return total;
 }
 
 std::string context_cost_hardware_class(std::string_view gpu_name, int major, int minor) {

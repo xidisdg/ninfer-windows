@@ -5,7 +5,6 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
-#include "ninfer/ops/gqa_attention.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
@@ -109,7 +108,6 @@ struct TargetVerifyFrameView {
     Tensor rope_positions;
     Tensor valid_columns;
     Tensor kv_table_rows;
-    Tensor lanes;
     Tensor state_source_slots;
     Tensor state_destination_slots;
     Tensor target_hidden;
@@ -117,6 +115,8 @@ struct TargetVerifyFrameView {
     Tensor target_tokens;
     Tensor drafts;
     Tensor current_extents;
+    Tensor candidate_ids;
+    Tensor proposal_q;
     Tensor frontiers;
     Tensor anchors;
     Tensor licensed_tokens;
@@ -197,12 +197,5 @@ void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std
                          DFlashEnvelopes envelopes,
                          ops::CausalAttentionExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable);
-void capture_dflash_decode_batch_v2(DFlashBatchContext& state, std::int32_t batch_size,
-                                    std::uint32_t k, DFlashEnvelopes envelopes,
-                                    ops::GqaExecutionEnvelope target_envelope,
-                                    DecodeGraphDefinition& definition);
-void dflash_decode_batch_v2(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
-                            DFlashEnvelopes envelopes, ops::GqaExecutionEnvelope target_envelope,
-                            DecodeGraphExecutable* executable);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

@@ -177,6 +177,10 @@ struct OutputDecision {
     std::uint32_t accepted_tokens   = 0;
     FinishReason finish_reason      = FinishReason::None;
     ContinuationAction continuation = ContinuationAction::Decode;
+    // Empty or one token-aligned frontier within the accepted span where model-history
+    // reconstruction gains an execution split. Frontend owns detection; Engine only transports
+    // this relative position.
+    std::optional<std::uint32_t> prefix_execution_split_after;
 
     [[nodiscard]] bool finished() const noexcept { return finish_reason != FinishReason::None; }
 };
@@ -210,6 +214,9 @@ struct CommitDecision {
     std::uint32_t accepted_tokens = 0;
     bool terminal                 = false;
     bool cancelled                = false;
+    // Copied unchanged from the corresponding OutputDecision; still relative to this row's
+    // accepted span.
+    std::optional<std::uint32_t> prefix_execution_split_after;
 };
 
 // Exact features for the startup-selected static prefill cost model. They describe only the
@@ -226,6 +233,14 @@ struct PrefillWork {
 
 // Exact prefill feature definition for a suffix beginning after prefix_tokens. Attention work is
 // prefix*suffix + suffix*(suffix+1)/2 and all arithmetic saturates.
+#if !defined(__SIZEOF_INT128__)
+// 64-bit saturating multiply for platforms without __int128 (MSVC x64).
+inline std::uint64_t saturating_u64_product(std::uint64_t left, std::uint64_t right) noexcept {
+    return right != 0 && left > std::numeric_limits<std::uint64_t>::max() / right
+               ? std::numeric_limits<std::uint64_t>::max()
+               : left * right;
+}
+#endif
 [[nodiscard]] inline PrefillWork make_prefill_work(std::uint64_t prefix_tokens,
                                                    std::uint64_t suffix_tokens,
                                                    std::uint64_t vision_items,
@@ -237,18 +252,30 @@ struct PrefillWork {
     result.tokens                       = suffix_tokens;
     result.vision_items                 = vision_items;
     result.vision_patches               = vision_patches;
-    const std::uint64_t kU64Max = std::numeric_limits<std::uint64_t>::max();
-    const std::uint64_t linear =
-        prefix_tokens != 0 && suffix_tokens > kU64Max / prefix_tokens
-            ? kU64Max
-            : prefix_tokens * suffix_tokens;
-    const std::uint64_t half =
-        suffix_tokens % 2U == 0 ? suffix_tokens / 2U : (suffix_tokens + 1U) / 2U;
-    const std::uint64_t other =
-        suffix_tokens % 2U == 0 ? suffix_tokens + 1U : suffix_tokens;
-    const std::uint64_t triangular =
-        half != 0 && other > kU64Max / half ? kU64Max : half * other;
-    result.attention_pairs = linear > kU64Max - triangular ? kU64Max : linear + triangular;
+#if defined(__SIZEOF_INT128__)
+    const unsigned __int128 suffix      = suffix_tokens;
+    const unsigned __int128 linear      = static_cast<unsigned __int128>(prefix_tokens) * suffix;
+    const unsigned __int128 triangular  = suffix * (suffix + 1U) / 2U;
+    constexpr unsigned __int128 maximum = ~static_cast<unsigned __int128>(0);
+    const unsigned __int128 attention =
+        triangular > maximum - linear ? maximum : linear + triangular;
+    result.attention_pairs = attention > std::numeric_limits<std::uint64_t>::max()
+                                 ? std::numeric_limits<std::uint64_t>::max()
+                                 : static_cast<std::uint64_t>(attention);
+#else
+    // MSVC x64 has no __int128. Split the triangular term so every product fits
+    // in 64 bits, then saturate the sum (equivalence verified by fuzz_u128.py).
+    const std::uint64_t linear = saturating_u64_product(prefix_tokens, suffix_tokens);
+    const std::uint64_t triangular = (suffix_tokens & 1U) == 0
+                                          ? saturating_u64_product(suffix_tokens >> 1U,
+                                                                  suffix_tokens + 1U)
+                                          : saturating_u64_product(suffix_tokens,
+                                                                   (suffix_tokens >> 1U) + 1U);
+    result.attention_pairs =
+        linear > std::numeric_limits<std::uint64_t>::max() - triangular
+            ? std::numeric_limits<std::uint64_t>::max()
+            : linear + triangular;
+#endif
     return result;
 }
 
@@ -360,9 +387,62 @@ enum class RetentionClass : std::uint8_t {
     Disposable,
 };
 
-enum class ClaimDisposition : std::uint8_t {
+enum class LogicalOwnerKind : std::uint8_t {
+    PrivateContinuation,
+    SharedPrefix,
+};
+
+struct LogicalOwnerKey {
+    LogicalOwnerKind kind = LogicalOwnerKind::PrivateContinuation;
+    std::uint64_t id      = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(LogicalOwnerKey,
+                                                   LogicalOwnerKey) noexcept = default;
+};
+
+struct CatalogCapability {
+    LogicalOwnerKey owner;
+    std::uint32_t slot       = std::numeric_limits<std::uint32_t>::max();
+    std::uint64_t generation = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(CatalogCapability,
+                                                   CatalogCapability) noexcept = default;
+};
+
+struct PlanningOwnerId {
+    std::uint32_t value = std::numeric_limits<std::uint32_t>::max();
+
+    [[nodiscard]] friend constexpr bool operator==(PlanningOwnerId,
+                                                   PlanningOwnerId) noexcept = default;
+};
+
+struct PlanningCandidateId {
+    std::uint32_t value = std::numeric_limits<std::uint32_t>::max();
+
+    [[nodiscard]] friend constexpr bool operator==(PlanningCandidateId,
+                                                   PlanningCandidateId) noexcept = default;
+};
+
+struct ProgramResourceRevision {
+    std::uint64_t value = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(ProgramResourceRevision,
+                                                   ProgramResourceRevision) noexcept = default;
+};
+
+// ResourceManager-owned final schedule policy. Program validates and consumes this view while
+// sealing the already assessed physical target; ResourcePlan is immutable after that boundary.
+struct FinalScheduleIntent {
+    std::span<const std::uint32_t> shared_capture_frontiers;
+};
+
+enum class PrivateSourceMode : std::uint8_t {
+    Retain,
+    ConsumeToActive,
+};
+
+enum class VictimDisposition : std::uint8_t {
     Retained,
-    ConsumedToActive,
     Evicted,
 };
 
@@ -403,29 +483,44 @@ enum class MaterializationPhysicalStatus : std::uint8_t {
     StructuralInvalid,
 };
 
-// Compact machine-only result of one complete materialization projection. Cache retention value
-// is deliberately absent; ResourceManager owns that policy and combines it with this summary.
-struct MaterializationMachineSummary {
-    std::uint64_t minimum_request_ns = 0;
-    std::uint64_t immediate_ns       = 0;
+inline constexpr std::size_t kContextTransferDirectionCount = 3;
+using CoalescedTransferWork = std::array<TransferWork, kContextTransferDirectionCount>;
+
+// Exact, unpriced machine work for one complete materialization projection. Program owns this
+// physical fact; the common search runner applies the immutable planning cost model exactly once.
+// `optimistic_candidate_transfers` is ordering evidence only and never proves feasibility.
+struct MaterializationMachineWork {
+    CoalescedTransferWork pressure_transfers;
+    CoalescedTransferWork candidate_transfers;
+    CoalescedTransferWork optimistic_candidate_transfers;
     PrefillWork remaining_prefill_work;
-    std::uint64_t transferred_bytes    = 0;
-    std::uint32_t copy_operations      = 0;
     std::uint32_t reused_prompt_tokens = 0;
 
     [[nodiscard]] friend constexpr bool
-    operator==(const MaterializationMachineSummary&,
-               const MaterializationMachineSummary&) noexcept = default;
+    operator==(const MaterializationMachineWork&,
+               const MaterializationMachineWork&) noexcept = default;
+};
+
+// One exact recovery recipe. Program enumerates every supported alternative; pricing policy
+// selects the cheapest alternative without changing physical legality or the target graph.
+struct CheckpointRecoveryAlternativeWork {
+    CoalescedTransferWork transfers;
+    PrefillWork prefill;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const CheckpointRecoveryAlternativeWork&,
+               const CheckpointRecoveryAlternativeWork&) noexcept = default;
 };
 
 struct IdentityMaterializationAssessment {
     MaterializationPhysicalStatus physical_status =
         MaterializationPhysicalStatus::StructuralInvalid;
-    ClaimDisposition source_disposition = ClaimDisposition::ConsumedToActive;
-    MaterializationMachineSummary machine;
-    bool expandable                 = false;
-    std::uint64_t projection_work   = 0;
-    std::uint64_t assessment_digest = 0;
+    PrivateSourceMode source_mode = PrivateSourceMode::ConsumeToActive;
+    MaterializationMachineWork machine_work;
+    bool pressure_may_change_machine_work = false;
+    bool expandable                       = false;
+    std::uint64_t projection_work         = 0;
+    std::uint64_t assessment_digest       = 0;
 
     [[nodiscard]] friend constexpr bool
     operator==(const IdentityMaterializationAssessment&,
@@ -433,25 +528,55 @@ struct IdentityMaterializationAssessment {
 };
 
 struct PressureCheckpointRecoveryImpact {
-    std::uint32_t owner_ordinal = 0;
+    PlanningOwnerId owner;
     CheckpointRef checkpoint;
-    std::uint64_t baseline_recovery_ns = 0;
-    std::uint64_t target_recovery_ns   = 0;
+    std::span<const CheckpointRecoveryAlternativeWork> target_recovery_work;
+    bool survives = true;
 
     [[nodiscard]] friend constexpr bool
     operator==(const PressureCheckpointRecoveryImpact&,
                const PressureCheckpointRecoveryImpact&) noexcept = default;
 };
 
+struct PressureCheckpointOutcome {
+    PlanningOwnerId owner;
+    CheckpointRef checkpoint;
+    bool survives = true;
+
+    [[nodiscard]] friend constexpr bool operator==(PressureCheckpointOutcome,
+                                                   PressureCheckpointOutcome) noexcept = default;
+};
+
 struct PressureOwnerOutcome {
-    std::uint32_t owner_ordinal       = 0;
-    ClaimDisposition disposition      = ClaimDisposition::Retained;
+    PlanningOwnerId owner;
+    VictimDisposition disposition     = VictimDisposition::Retained;
     std::uint32_t degradation_units   = 0;
     std::uint32_t dropped_checkpoints = 0;
-    bool shared                       = false;
 
     [[nodiscard]] friend constexpr bool operator==(const PressureOwnerOutcome&,
                                                    const PressureOwnerOutcome&) noexcept = default;
+};
+
+// Cheap, target-neutral ordering evidence for an unassessed pressure target.  This is deliberately
+// not a feasibility certificate: only PressureTargetAssessment may admit or seal a target.  The
+// Program owns the physical projection and the common planner combines the owner outcomes with its
+// retention policy.
+struct PressurePhysicalGuidance {
+    std::uint32_t unsatisfied_constraints   = 0;
+    std::uint32_t estimated_remaining_steps = 0;
+    std::uint64_t normalized_residual_q20   = 0;
+};
+
+// The spans are borrowed from a PressurePlanningSession scratch generation and remain valid only
+// until the next session operation.  The common planner folds them immediately into owning values.
+struct PressureTargetGuidance {
+    PressurePhysicalGuidance physical;
+    MaterializationMachineWork estimated_machine_work;
+    std::span<const PressureOwnerOutcome> owner_outcomes;
+    PlanningCandidateId candidate;
+    std::uint32_t stable_target_ordinal = 0;
+    std::uint32_t degradation_units     = 0;
+    std::uint32_t dropped_checkpoints   = 0;
 };
 
 // The spans are borrowed from a PressurePlanningSession scratch generation and remain valid only
@@ -459,11 +584,11 @@ struct PressureOwnerOutcome {
 struct PressureTargetAssessment {
     MaterializationPhysicalStatus physical_status =
         MaterializationPhysicalStatus::StructuralInvalid;
-    ClaimDisposition source_disposition = ClaimDisposition::ConsumedToActive;
-    MaterializationMachineSummary machine;
+    PrivateSourceMode source_mode = PrivateSourceMode::ConsumeToActive;
+    MaterializationMachineWork machine_work;
     std::span<const PressureOwnerOutcome> owner_outcomes;
     std::span<const PressureCheckpointRecoveryImpact> checkpoint_impacts;
-    std::uint32_t candidate_ordinal     = 0;
+    PlanningCandidateId candidate;
     std::uint32_t stable_target_ordinal = 0;
     std::uint32_t degradation_units     = 0;
     std::uint32_t dropped_checkpoints   = 0;

@@ -16,7 +16,7 @@
 
 #include "serve/webui_update.h"
 
-#include "serve/console_log.h"
+#include <spdlog/logger.h>
 
 #include <windows.h>
 #include <winhttp.h>
@@ -36,6 +36,10 @@ namespace ninfer::serve {
 namespace {
 
 namespace fs = std::filesystem;
+
+void webui_log_info(std::shared_ptr<spdlog::logger> logger, const std::string& message) {
+    if (logger != nullptr) { logger->info("{}", message); }
+}
 
 constexpr const char* kBucketApi    = "https://huggingface.co/api/buckets/ggml-org/llama-ui/tree/latest";
 constexpr const char* kBucketBase   = "https://huggingface.co/buckets/ggml-org/llama-ui/resolve/latest/";
@@ -302,25 +306,26 @@ std::string resolve_webui_dir(const ServeOptions& options) {
     return to_utf8((dir / "webui").lexically_normal());
 }
 
-std::string ensure_webui_available(const std::string& webui_dir) {
+std::string ensure_webui_available(const std::string& webui_dir,
+                                  std::shared_ptr<spdlog::logger> logger) {
     const fs::path target(webui_dir);
 
     // Sweep staging dirs left behind by a previously interrupted download.
     for (const auto& stale : staged_stale_dirs(target)) {
         std::error_code ec;
         fs::remove_all(stale, ec);
-        write_console_log(ConsoleLogLevel::Info, "removed stale webui staging directory " + to_utf8(stale));
+        webui_log_info(logger, "removed stale webui staging directory " + to_utf8(stale));
     }
 
     const std::string version = fetch_latest_version();
 
     if (local_copy_is_current(target, version)) {
-        write_console_log(ConsoleLogLevel::Info,
+        webui_log_info(logger,
                           "webui up to date (version " + version + ") at " + webui_dir);
         return webui_dir;
     }
 
-    write_console_log(ConsoleLogLevel::Info, "downloading latest webui (version " + version +
+    webui_log_info(logger, "downloading latest webui (version " + version +
                                                   ") from ggml-org/llama-ui...");
 
     const std::vector<WebuiFile> files = fetch_file_list();
@@ -374,7 +379,7 @@ std::string ensure_webui_available(const std::string& webui_dir) {
     fs::remove_all(old, ec);
 
     const double mib = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
-    write_console_log(ConsoleLogLevel::Info,
+    webui_log_info(logger,
                       std::to_string(files.size()) + " webui files (" +
                           (mib >= 10 ? std::to_string(static_cast<int>(mib)) :
                                        std::to_string(static_cast<int>(mib * 10) / 10)) +

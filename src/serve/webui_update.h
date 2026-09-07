@@ -7,8 +7,13 @@
 #include "serve/serve_options.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
+
+namespace spdlog {
+class logger;
+}
 
 namespace ninfer::serve {
 
@@ -20,6 +25,7 @@ std::string resolve_webui_dir(const ServeOptions& options);
 // "latest" pointer) into webui_dir when the local copy is missing, stale, or
 // incomplete, then returns webui_dir ready to serve. Throws std::runtime_error
 // on an unrecoverable download failure. No-op when the local copy is current.
-std::string ensure_webui_available(const std::string& webui_dir);
+std::string ensure_webui_available(const std::string& webui_dir,
+                                   std::shared_ptr<spdlog::logger> logger);
 
 } // namespace ninfer::serve

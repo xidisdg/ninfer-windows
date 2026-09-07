@@ -6,17 +6,24 @@
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <utility>
 
 namespace {
 
-using AlignedBacking = std::unique_ptr<void, decltype(&std::free)>;
+constexpr std::size_t kBackingAlignment = 256;
+
+struct AlignedBackingDeleter {
+    void operator()(void* data) const noexcept {
+        ::operator delete(data, std::align_val_t{kBackingAlignment});
+    }
+};
+
+using AlignedBacking = std::unique_ptr<void, AlignedBackingDeleter>;
 
 AlignedBacking make_backing(std::size_t bytes) {
-    void* data = std::aligned_alloc(256, bytes);
-    if (data == nullptr) { throw std::bad_alloc(); }
-    return AlignedBacking(data, &std::free);
+    return AlignedBacking(::operator new(bytes, std::align_val_t{kBackingAlignment}));
 }
 
 int fail(const char* label) {

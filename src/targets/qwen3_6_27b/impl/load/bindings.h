@@ -1,6 +1,5 @@
 #pragma once
 
-#include "targets/qwen3_6_27b/impl/config.h"
 #include <ninfer/targets/qwen3_6_27b/package.h>
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
 #include <ninfer/targets/qwen3_6/model_view.h>
@@ -14,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <variant>
 
@@ -105,38 +105,41 @@ struct MtpPlan {
     artifact::ObjectHandle final_norm;
 };
 
-// DFlash2 (drafter v2) binding plan: 5 all-sliding-window layers with two-tap dynamic
-// convolutions on the attention and MLP sublayers, plus the candidate selector codebooks
-// and hidden projection. The artifact objects live under the `dflash2/` namespace.
+struct DFlash2DynamicConvPlan {
+    artifact::ObjectHandle base_kernel;
+    WeightPlan kernel_projection;
+};
+
 struct DFlash2LayerPlan {
     artifact::ObjectHandle input_norm;
-    artifact::ObjectHandle query_key_value;
+    DFlash2DynamicConvPlan attention_conv;
+    WeightPlan query_key_value;
     artifact::ObjectHandle query_norm;
     artifact::ObjectHandle key_norm;
-    artifact::ObjectHandle attention_output;
-    artifact::ObjectHandle attention_conv_base;
-    artifact::ObjectHandle attention_conv_projection;
+    WeightPlan attention_output;
     artifact::ObjectHandle post_attention_norm;
-    artifact::ObjectHandle gate_up;
-    artifact::ObjectHandle down;
-    artifact::ObjectHandle mlp_conv_base;
-    artifact::ObjectHandle mlp_conv_projection;
+    DFlash2DynamicConvPlan mlp_conv;
+    WeightPlan gate_up;
+    WeightPlan down;
+};
+
+struct DFlash2CandidateSelectorPlan {
+    WeightPlan hidden_projection;
+    artifact::ObjectHandle predecessor_codebook;
+    artifact::ObjectHandle successor_codebook;
 };
 
 struct DFlash2Plan {
-    artifact::ObjectHandle feature_projection;
+    WeightPlan feature_projection;
     artifact::ObjectHandle context_norm;
-    std::array<DFlash2LayerPlan, DFlashConfig::layers> layers;
+    std::array<DFlash2LayerPlan, qwen3_6::DFlash2Weights::layer_count> layers;
     artifact::ObjectHandle final_norm;
-    artifact::ObjectHandle selector_predecessor_codebook;
-    artifact::ObjectHandle selector_successor_codebook;
-    artifact::ObjectHandle selector_hidden_projection;
+    DFlash2CandidateSelectorPlan candidate_selector;
 };
 
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
-    WeightsProfile weights_profile;
 
     WeightPlan token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
@@ -145,7 +148,7 @@ struct BindingPlan {
     artifact::ObjectHandle draft_head;
     artifact::ObjectHandle draft_head_token_ids;
     MtpPlan mtp;
-    DFlash2Plan dflash;
+    std::optional<DFlash2Plan> dflash2;
 
     qwen3_6::VisionBackbonePlan vision_backbone;
     qwen3_6::VisionMergerInputPlan vision_merger_input;
@@ -220,12 +223,11 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlash2Weights<5>,
+                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlash2Weights,
                        kFullAttentionLayers, kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;
-using DFlash2Weights       = RuntimeModelView::DFlash;
 
 class LoadedModelData {
 public:

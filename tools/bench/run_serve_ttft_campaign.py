@@ -41,6 +41,8 @@ RESOURCE_CASES = (
     "resume-after-interference-evicted",
     "resume-after-interference-catalog",
     "session-alternating-64k-host-swap",
+    "session-rotation-55k-host",
+    "session-rotation-55k-two-cohort-stream",
 )
 CAMPAIGNS = {
     "smoke": ("cold-short",),
@@ -90,8 +92,9 @@ def _stage_weights() -> tuple[Path, dict[str, Any]]:
 
     source = WEIGHTS.resolve()
     status = source.stat()
-    if status.st_size <= 0 or status.st_size % 4096 != 0:
-        raise CampaignError("the standard artifact is not a nonempty 4096-byte-aligned file")
+    # The container aligns its payload start, not its total file size.
+    if status.st_size <= 0:
+        raise CampaignError("the standard artifact is empty")
 
     fingerprint = (
         f"{status.st_dev:x}-{status.st_ino:x}-{status.st_size:x}-{status.st_mtime_ns:x}"
@@ -350,7 +353,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     selection.add_argument(
         "--campaign",
         choices=tuple(CAMPAIGNS),
-        help="smoke=one baseline, resource=six placement comparisons, full=all audited cases",
+        help="smoke=one baseline, resource=pressure and Host-rotation cases, full=all audited cases",
     )
     selection.add_argument(
         "--case",
@@ -361,7 +364,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--samples", type=int, default=1)
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--startup-timeout-seconds", type=float, default=120.0)
+    parser.add_argument("--startup-timeout-seconds", type=float, default=300.0)
     parser.add_argument("--request-timeout-seconds", type=float, default=600.0)
     args = parser.parse_args(argv)
     if args.samples <= 0:

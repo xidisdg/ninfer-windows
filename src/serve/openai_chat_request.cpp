@@ -1,4 +1,5 @@
 #include "serve/openai_chat.h"
+#include "serve/openai_common.h"
 #include "serve/request_validation.h"
 
 #include <algorithm>
@@ -12,7 +13,7 @@
 namespace ninfer::serve {
 namespace {
 
-using Json = nlohmann::json;
+using Json = RequestJson;
 
 void require_object(const Json& value, const char* message, const char* param = nullptr) {
     if (!value.is_object()) { bad_request(message, param == nullptr ? "" : param); }
@@ -352,6 +353,9 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
             bad_request("content type '" + type + "' is not supported", "messages",
                         "modality_not_supported");
         }
+        if (parse_openai_prompt_cache_breakpoint(part, "messages")) {
+            parsed.cache_boundary_after = CacheBoundary{};
+        }
         turn.content.push_back(std::move(parsed));
     }
 }
@@ -430,9 +434,18 @@ std::optional<std::string> parse_assistant_reasoning(const Json& message, std::s
     return reasoning ? reasoning : content;
 }
 
-void validate_message_name(const Json& item) {
+void validate_message_name(const Json& item, bool legacy_function, ChatRole role) {
     if (!item.contains("name") || item.at("name").is_null()) { return; }
     if (!item.at("name").is_string()) { bad_request("message name must be a string", "messages"); }
+    const std::string name = item.at("name").get<std::string>();
+    // OpenAI permits a non-empty name on tool messages (the tool identifier, redundant
+    // with tool_call_id). On every other role it would change participant identity, which
+    // the chat template cannot represent.
+    if (!name.empty() && !legacy_function && role != ChatRole::Tool) {
+        bad_request("a non-empty message name changes participant identity, which NInfer's chat "
+                    "template cannot represent",
+                    "messages", "message_name_not_supported");
+    }
 }
 
 void validate_non_assistant_fields(const Json& item, ChatRole role) {
@@ -551,7 +564,7 @@ ChatTurn parse_message(const Json& item, std::size_t index) {
     const bool legacy_function  = role_name == "function";
     const ChatRole role         = legacy_function ? ChatRole::Tool : parse_message_role(role_name);
 
-    validate_message_name(item);
+    validate_message_name(item, legacy_function, role);
     if (legacy_function) { (void)require_function_name(item, "messages"); }
     validate_non_assistant_fields(item, role);
 
@@ -848,6 +861,11 @@ void parse_stream_options(const Json& body, OpenAIChatRequest& output) {
     }
 }
 
+void parse_response_observations(const Json& body, OpenAIChatRequest& output) {
+    output.timings_per_token = get_bool(body, "timings_per_token", false);
+    output.return_progress   = get_bool(body, "return_progress", false);
+}
+
 void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAIChatRequest& output) {
     std::optional<int> limit = optional_int(body, "max_completion_tokens");
     const char* param        = "max_completion_tokens";
@@ -866,7 +884,8 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
 
 } // namespace
 
-OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits,
+OpenAIChatRequest parse_chat_completion_request(const Json& body,
+                                                const RequestLimits& limits,
                                                 const std::string& default_model) {
     require_object(body, "request body must be a JSON object");
     validate_standard_output_controls(body);
@@ -874,17 +893,19 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     validate_compatibility_hints(body);
 
     OpenAIChatRequest output;
-    if (!body.contains("model") || !body.at("model").is_string() ||
-        body.at("model").get<std::string>().empty()) {
-        // llama.cpp webui clients run against a single loaded model and omit the
-        // field; fill it from the process public model id when one is known.
+    if (body.contains("model") && body.at("model").is_string() &&
+        !body.at("model").get<std::string>().empty()) {
+        output.model = body.at("model").get<std::string>();
+    } else {
+        // Single-model clients (e.g. the bundled prebuilt llama.cpp webui) omit
+        // `model`; serve against the loaded artifact instead of rejecting the request.
         if (default_model.empty()) {
             bad_request("missing required field: model", "model");
         }
         output.model = default_model;
-    } else {
-        output.model = body.at("model").get<std::string>();
     }
+
+    const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
 
     parse_tools(body, output.generation);
     parse_tool_choice(body, output.generation);
@@ -893,11 +914,13 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_stop(body, output.generation);
     parse_sampling(body, output.generation);
     parse_stream_options(body, output);
+    parse_response_observations(body, output);
     parse_output_limit(body, limits, output);
     parse_reasoning_effort(body, output.generation);
     const TemplateOptions template_options = parse_template_options(body);
     output.generation.enable_thinking      = template_options.enable_thinking;
     output.generation.preserve_thinking    = template_options.preserve_thinking;
+    apply_openai_prompt_cache_policy(output.generation, cache_policy);
     return output;
 }
 
