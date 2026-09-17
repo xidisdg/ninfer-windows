@@ -46,6 +46,10 @@ Nvfp4W4a4TmaDescriptors make_descriptors(const std::uint8_t* activation_codes,
 }
 
 #ifdef _WIN32
+// MSVC cannot pass an alignas(128) struct by value as a kernel parameter (C2719). Keep the
+// descriptor block in a device buffer and hand the kernel a pointer; the TMA unit reads the
+// tensor map from that address. cudaMallocAsync is pool-backed; the free is stream-ordered
+// after the kernel that consumes the block.
 struct Nvfp4LinearSwiGluTmaDescriptorBlock {
     Nvfp4W4a4TmaDescriptors* device = nullptr;
 
@@ -54,8 +58,10 @@ struct Nvfp4LinearSwiGluTmaDescriptorBlock {
                                    sizeof(Nvfp4W4a4TmaDescriptors), stream));
     }
 
-    Nvfp4LinearSwiGluTmaDescriptorBlock(const Nvfp4LinearSwiGluTmaDescriptorBlock&)            = delete;
-    Nvfp4LinearSwiGluTmaDescriptorBlock& operator=(const Nvfp4LinearSwiGluTmaDescriptorBlock&) = delete;
+    Nvfp4LinearSwiGluTmaDescriptorBlock(const Nvfp4LinearSwiGluTmaDescriptorBlock&)
+        = delete;
+    Nvfp4LinearSwiGluTmaDescriptorBlock&
+    operator=(const Nvfp4LinearSwiGluTmaDescriptorBlock&) = delete;
 
     ~Nvfp4LinearSwiGluTmaDescriptorBlock() {
         if (device == nullptr) { return; }
@@ -76,7 +82,7 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
             "nvfp4 LinearSwiGLU TMA requires a positive M256 full-tile token count");
     }
 
-    using Geometry                     = Nvfp4MlpGateUpGeometry;
+    using Geometry                     = Nvfp4N34816K5120;
     constexpr std::size_t kSharedBytes = sizeof(Nvfp4LinearSwiGluTmaSharedStorage<M256N128S3>);
     static const bool kConfigured      = [] {
         CUDA_CHECK(cudaFuncSetAttribute(nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>,

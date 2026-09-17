@@ -53,9 +53,7 @@ OpenAIChatRequest parse(Json body) {
 
 ResolvedPromptSemantics semantics(const GenerationRequest& request) {
     ServeOptions server;
-    ninfer::PromptCapabilities capabilities;
-    capabilities.enable_thinking = true;
-    return resolve_prompt_semantics(request, server, capabilities);
+    return resolve_prompt_semantics(request, server);
 }
 
 ninfer::PromptInput prompt(const GenerationRequest& request) {
@@ -552,8 +550,8 @@ int test_reasoning_and_extensions() {
     body                         = base_request();
     body["chat_template_kwargs"] = Json{{"future", 1}};
     failures +=
-        check(api_error([&] { (void)parse(body); }).code == "chat_template_option_not_supported",
-              "unknown meaningful template option rejected");
+        check(Json::parse(parse(body).generation.chat_template_kwargs_json).at("future") == 1,
+              "custom template keyword did not survive protocol parsing");
     body["chat_template_kwargs"] = Json{{"future", nullptr}};
     failures += check(parse(body).generation.messages.size() == 1,
                       "null unknown template option is neutral");
