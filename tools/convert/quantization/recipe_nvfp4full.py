@@ -588,7 +588,14 @@ def preflight_quantized_metadata(reader: ShardReader) -> dict[str, int]:
         if item.dtype == "F8_E4M3" and name.endswith(".weight")
     }
     expected_fp8 = 233
-    if len(fp8_fields) != expected_fp8:
+    # The registered unsloth source keeps lm_head as row-scaled FP8 (233).
+    # The orcarouter variant keeps lm_head in BF16 in the quantized source
+    # (232); the converter encodes it from the BF16 base via the registered
+    # text/output_head recipe, so that layout is accepted as well.
+    if len(fp8_fields) == 232:
+        if any(name == "lm_head.weight" for name in fp8_fields):
+            raise ValueError("quantized source FP8 allocation inconsistent: 232 fields but lm_head.weight is FP8")
+    elif len(fp8_fields) != expected_fp8:
         raise ValueError(
             f"quantized source FP8 allocation has {len(fp8_fields)} matrices, "
             f"expected {expected_fp8}"
