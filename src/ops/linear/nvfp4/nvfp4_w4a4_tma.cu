@@ -7,8 +7,11 @@
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma.cuh"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_epilogue.cuh"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <vector>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -55,14 +58,66 @@ static_assert((kKeyRows % TmaM256N128::kBlockN) == 0);
 static_assert((kGateRows % TmaM256N128::kBlockN) == 0);
 
 #ifdef _WIN32
-// MSVC cannot pass an alignas(128) struct by value as a kernel parameter (C2719). Keep the
-// descriptor block in a device buffer and hand the kernel a pointer; the TMA unit reads the
-// tensor map from that address. cudaMallocAsync is pool-backed; the free is stream-ordered
-// after the kernel that consumes the block.
+// MSVC cannot pass an alignas(128) struct by value as a kernel parameter (C2719), so the
+// kernel takes a pointer to a device descriptor block. The H2D copy of that block is
+// captured as a CUDA Graph node whose host source is re-read on every replay, so the
+// source must outlive the graph: a bounded pinned-host cache keeps distinct descriptor
+// bytes alive for the process (one entry per geometry/shape combination).
+struct PinnedDescriptorSource {
+    std::array<std::uint8_t, sizeof(Nvfp4W4a4TmaDescriptors)> bytes{};
+    void* host = nullptr;
+};
+
+struct PinnedDescriptorCache {
+    // Pinned buffers are allocated up front, before any stream capture can run:
+    // cudaHostAlloc is not permitted while a stream is capturing, and the first descriptor
+    // upload of a captured graph happens inside the capture.
+    static constexpr std::size_t kPinnedPoolSize = 64;
+
+    std::vector<void*> pinned_pool;
+    std::vector<PinnedDescriptorSource> entries;
+
+    PinnedDescriptorCache() {
+        pinned_pool.reserve(kPinnedPoolSize);
+        for (std::size_t i = 0; i < kPinnedPoolSize; ++i) {
+            void* host = nullptr;
+            CUDA_CHECK(cudaHostAlloc(&host, sizeof(Nvfp4W4a4TmaDescriptors),
+                                     cudaHostAllocDefault));
+            pinned_pool.push_back(host);
+        }
+    }
+
+    // Entries are grow-only: a freed pinned buffer could still be the host source of a
+    // captured graph's H2D copy node, so entries are never released while the process runs.
+    void* source_for(const Nvfp4W4a4TmaDescriptors& descriptor) {
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(&descriptor);
+        for (auto& entry : entries) {
+            if (std::equal(bytes, bytes + entry.bytes.size(), entry.bytes.data())) {
+                return entry.host;
+            }
+        }
+        PinnedDescriptorSource entry;
+        std::copy_n(bytes, entry.bytes.size(), entry.bytes.begin());
+        if (!pinned_pool.empty()) {
+            entry.host = pinned_pool.back();
+            pinned_pool.pop_back();
+        } else {
+            CUDA_CHECK(cudaHostAlloc(&entry.host, sizeof(Nvfp4W4a4TmaDescriptors),
+                                     cudaHostAllocDefault));
+        }
+        std::memcpy(entry.host, bytes, sizeof(Nvfp4W4a4TmaDescriptors));
+        entries.push_back(std::move(entry));
+        return entries.back().host;
+    }
+};
+
+PinnedDescriptorCache pinned_descriptor_cache;
+
 struct Nvfp4TmaDescriptorBlock {
     Nvfp4W4a4TmaDescriptors* device = nullptr;
+    cudaStream_t stream             = nullptr;
 
-    explicit Nvfp4TmaDescriptorBlock(cudaStream_t stream) {
+    explicit Nvfp4TmaDescriptorBlock(cudaStream_t stream) : stream(stream) {
         CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&device),
                                    sizeof(Nvfp4W4a4TmaDescriptors), stream));
     }
@@ -72,7 +127,7 @@ struct Nvfp4TmaDescriptorBlock {
 
     ~Nvfp4TmaDescriptorBlock() {
         if (device == nullptr) { return; }
-        CUDA_CHECK(cudaFreeAsync(device, nullptr));
+        CUDA_CHECK(cudaFreeAsync(device, stream));
     }
 };
 #endif
@@ -97,8 +152,9 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
 
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN, tokens / Schedule::kBlockM);
 #ifdef _WIN32
+    void* descriptor_host = pinned_descriptor_cache.source_for(descriptors);
     Nvfp4TmaDescriptorBlock block(stream);
-    CUDA_CHECK(cudaMemcpyAsync(block.device, &descriptors, sizeof(descriptors),
+    CUDA_CHECK(cudaMemcpyAsync(block.device, descriptor_host, sizeof(descriptors),
                                cudaMemcpyHostToDevice, stream));
     nvfp4_w4a4_tma_kernel<Geometry, Schedule, Epilogue, Output>
         <<<grid, Schedule::kThreads, kSharedBytes, stream>>>(block.device, alpha, epilogue, output);
@@ -122,8 +178,8 @@ void launch_linear(const std::uint8_t* activation_codes, const std::uint8_t* act
 
 void launch_nvfp4_w4a4_tma_linear(Nvfp4GeometryId problem, const std::uint8_t* activation_codes,
                                   const std::uint8_t* activation_scales,
-                                  const std::uint8_t* weight_codes,
-                                  const std::uint8_t* weight_scales, __nv_bfloat16* output,
+                                  const std::uint8_t* weight_codes, const std::uint8_t* weight_scales,
+                                  __nv_bfloat16* output,
                                   std::int32_t tokens, float alpha, cudaStream_t stream) {
     switch (problem) {
     case Nvfp4GeometryId::N14336K5120:

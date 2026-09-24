@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-time, standard-library upgrade of the seven known official NInfer v2 inputs.
+"""One-time, standard-library upgrade of the known official and local full-NVFP4 NInfer v2 inputs.
 
 Run: python3 upgrade_ninfer_v2_to_v3.py INPUT.ninfer OUTPUT.ninfer
 Weight bytes are preserved and the maintained Qwen chat template is installed.
@@ -16,6 +16,17 @@ import re
 import struct
 import tempfile
 import uuid
+
+# os.fdatasync and os.posix_fadvise are POSIX-only; page-cache hints are best effort,
+# so they degrade to no-ops on Windows.
+def _fdatasync(fd):
+    if hasattr(os, "fdatasync"):
+        os.fdatasync(fd)
+
+
+def _fadvise_dontneed(fd, offset=0, length=0):
+    if hasattr(os, "posix_fadvise"):
+        os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
 
 FORMATS = {
     "BF16": "bf16",
@@ -39,6 +50,9 @@ KNOWN_COUNTS = {
     ("qwen3.6-27b", "nvfp4"): (1307,),
     ("qwen3.8-27b", "groupwise-int"): (1124, 1190),
     ("qwen3.8-27b", "nvfp4"): (1124, 1190),
+    # Local full-NVFP4 recipe: all main projections NVFP4 plus per-projection
+    # activation scale divisors.
+    ("qwen3.8-27b", "nvfp4full"): (1325,),
     ("qwen3.6-35b-a3b", "groupwise-int"): (940,),
 }
 LIMIT = 32_000_000_000
@@ -828,11 +842,10 @@ def upgrade(input_path, output_path):
                             )
                             if not chunk:
                                 raise ValueError("v2 payload ended prematurely")
-                            os.posix_fadvise(
+                            _fadvise_dontneed(
                                 source.fileno(),
                                 source.tell() - len(chunk),
                                 len(chunk),
-                                os.POSIX_FADV_DONTNEED,
                             )
                         elif cursor < template_offset:
                             chunk = bytes(min(remaining, template_offset - cursor))
@@ -845,15 +858,13 @@ def upgrade(input_path, output_path):
                         pending += len(chunk)
                         if pending >= WRITEBACK:
                             output.flush()
-                            os.fdatasync(output.fileno())
-                            os.posix_fadvise(
-                                output.fileno(), 0, 0, os.POSIX_FADV_DONTNEED
-                            )
+                            _fdatasync(output.fileno())
+                            _fadvise_dontneed(output.fileno())
                             pending = 0
                     output.flush()
-                    os.fdatasync(output.fileno())
-                    os.posix_fadvise(output.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-            os.posix_fadvise(source.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                    _fdatasync(output.fileno())
+                    _fadvise_dontneed(output.fileno())
+            _fadvise_dontneed(source.fileno())
         for index in [*range(1, len(targets)), 0]:
             os.link(temporary[index], targets[index])
             published.append(targets[index])

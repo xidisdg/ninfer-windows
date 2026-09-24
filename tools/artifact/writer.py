@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from .framing import HEADER, MAGIC, PART_MAGIC, PAYLOAD_ALIGNMENT
 from .layouts import align_up
-from .file_io import IO_CHUNK_BYTES, Writeback
+from .file_io import IO_CHUNK_BYTES, Writeback, pwrite
 from .schema import (
     ArtifactError,
     ArtifactObject,
@@ -26,6 +26,20 @@ from .schema import (
 
 DEFAULT_MAX_FILE_BYTES = 32_000_000_000
 ZERO_CHUNK_BYTES = 1024 * 1024
+
+if hasattr(os, "pwrite"):
+    _pwrite = os.pwrite
+else:
+
+    def _pwrite(fd: int, data: bytes | memoryview, offset: int) -> int:
+        # Windows: no pwrite. The writer owns a dedicated fd per file and
+        # tracks its own logical offset, so lseek + write (with the offset
+        # restored) is equivalent.
+        original = os.lseek(fd, 0, os.SEEK_CUR)
+        os.lseek(fd, offset, os.SEEK_SET)
+        count = os.write(fd, data)
+        os.lseek(fd, original, os.SEEK_CUR)
+        return count
 
 
 def layout_directory(
@@ -182,7 +196,7 @@ class ArtifactWriter:
     def _write_file(self, fd: int, offset: int, data: bytes | memoryview) -> None:
         view = memoryview(data).cast("B")
         while view:
-            count = os.pwrite(fd, view[:IO_CHUNK_BYTES], offset)
+            count = pwrite(fd, view[:IO_CHUNK_BYTES], offset)
             if count <= 0:
                 raise OSError(f"short write at file offset {offset}")
             view = view[count:]

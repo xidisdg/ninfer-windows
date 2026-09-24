@@ -17,6 +17,20 @@
 
 namespace {
 
+// Deterministic wall clock for materialization-planner tests: time advances only by the
+// fake session's modeled assessment delay, so search-budget decisions (initial grant,
+// fast path, renewal) are machine independent instead of depending on host speed.
+struct DeterministicSearchClock {
+    using duration = std::chrono::nanoseconds;
+    using rep      = std::int64_t;
+    using period   = std::chrono::nanoseconds::period;
+    static constexpr bool is_steady = true;
+    using time_point = std::chrono::time_point<DeterministicSearchClock, duration>;
+
+    static inline std::uint64_t now_ns = 0;
+    static time_point now() noexcept { return time_point{duration{static_cast<rep>(now_ns)}}; }
+};
+
 using ninfer::PrefixReusePath;
 using ninfer::RuntimeStats;
 using ninfer::runtime::CancellationFlagView;
@@ -1510,6 +1524,8 @@ FakeAssessedPressureTarget FakePressurePlanningSession::assess(FakePressureTarge
     if (program_->pressure_assessment_delay_us != 0) {
         std::this_thread::sleep_for(
             std::chrono::microseconds(program_->pressure_assessment_delay_us));
+        DeterministicSearchClock::now_ns +=
+            std::uint64_t(program_->pressure_assessment_delay_us) * 1'000ULL;
     }
     ++program_->pressure_target_assessments;
     const Target& target = targets_[handle.index];
@@ -2168,7 +2184,9 @@ void test_machine_cost_changes_selection_without_changing_physical_assessment() 
 }
 
 void test_candidate_search_prefers_deep_reuse_without_eviction() {
-    using Planner = ninfer::runtime::MaterializationPlanner<FakeModelContract>;
+    // Deterministic clock: the planner's wall-clock budget otherwise depends on host speed,
+    // because each fake assessment sleeps pressure_assessment_delay_us in real time.
+    using Planner = ninfer::runtime::MaterializationPlanner<FakeModelContract, DeterministicSearchClock>;
 
     FakeProgram program;
     program.required_pressure_actions         = 2;
@@ -2262,6 +2280,7 @@ void test_candidate_search_prefers_deep_reuse_without_eviction() {
         -> std::optional<Planner::LogicalGoal> {
         return Planner::LogicalGoal{.publication_slot = 0};
     };
+    DeterministicSearchClock::now_ns = 0;
     auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
                                pressure_inputs, logical_goal, Planner::Clock::now());
 

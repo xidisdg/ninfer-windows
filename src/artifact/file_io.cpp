@@ -49,8 +49,10 @@ std::uint64_t read_at(const std::filesystem::path& path, HANDLE handle, std::uin
 } // namespace
 
 InputFile::InputFile(std::filesystem::path path) : path_(std::move(path)) {
-    file_ = ::CreateFileW(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                          FILE_ATTRIBUTE_NORMAL, nullptr);
+    // Share write access like POSIX readers: a reader must not exclude writers
+    // (and FILE_FLAG_NO_BUFFERING below requires write sharing).
+    file_ = ::CreateFileW(path_.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file_ == INVALID_HANDLE_VALUE) { fail(path_, "open", ::GetLastError()); }
 
     LARGE_INTEGER file_size{};
@@ -88,8 +90,8 @@ std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> de
     }
     if (destination.empty()) { return 0; }
     if (direct_file_ == INVALID_HANDLE_VALUE) {
-        direct_file_ = ::CreateFileW(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                     OPEN_EXISTING,
+        direct_file_ = ::CreateFileW(path_.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                     nullptr, OPEN_EXISTING,
                                      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING |
                                          FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN,
                                      nullptr);

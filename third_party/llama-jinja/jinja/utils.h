@@ -31,7 +31,8 @@ static std::string peak_source(const std::string& source, size_t pos, size_t max
     size_t start       = (pos >= max_peak_chars) ? (pos - max_peak_chars) : 0;
     size_t end         = std::min(pos + max_peak_chars, source.length());
     std::string substr = source.substr(start, end - start);
-    string_replace_all(substr, "\n", "↵");
+    // Byte-exact escapes keep the U+21B5 glyph intact under any source codepage.
+    string_replace_all(substr, "\n", "\xE2\x86\xB5");
     output += "..." + substr + "...\n";
     std::string spaces(pos - start + 3, ' ');
     output += spaces + "^";

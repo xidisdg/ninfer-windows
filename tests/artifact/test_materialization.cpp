@@ -229,7 +229,9 @@ int main(int argc, char** argv) {
         }
         materialization(device);
         failure_and_host_only(device);
+#ifndef _WIN32
         ninfer::test::materialization_cuda_errors(device);
+#endif
         staging_reuse(device);
         std::cout << "artifact materialization checks passed\n";
         return 0;

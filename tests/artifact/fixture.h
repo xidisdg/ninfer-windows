@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -46,12 +47,25 @@ struct Fixture {
     std::vector<std::byte> payload;
 
     Fixture() : payload(1344) {
+#ifdef _WIN32
+        // MSVC has no mkdtemp; create a uniquely suffixed temp directory instead.
+        std::string name = "ninfer-artifact-";
+        std::random_device random;
+        for (int i = 0; i < 16; ++i) { name += "0123456789abcdef"[random() & 0xF]; }
+        const auto candidate = std::filesystem::temp_directory_path() / name;
+        std::error_code error;
+        if (!std::filesystem::create_directory(candidate, error)) {
+            throw std::runtime_error("cannot create fixture directory");
+        }
+        directory = candidate;
+#else
         auto pattern = (std::filesystem::temp_directory_path() / "ninfer-artifact-XXXXXX").string();
         std::vector<char> buffer(pattern.begin(), pattern.end());
         buffer.push_back('\0');
         const char* path = ::mkdtemp(buffer.data());
         if (!path) { throw std::runtime_error("cannot create fixture directory"); }
         directory = path;
+#endif
         entry     = directory / "model.ninfer";
         root      = {
             {"components",

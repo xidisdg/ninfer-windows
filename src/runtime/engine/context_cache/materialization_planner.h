@@ -5,6 +5,10 @@
 #include "runtime/engine/context_cache/materialization_budget.h"
 #include "runtime/engine/context_cache/resource_search.h"
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -50,6 +54,49 @@ public:
     using PressureTargetHandle   = typename ModelContract::PressureTargetHandle;
     using AssessedPressureTarget = typename ModelContract::AssessedPressureTarget;
     using Clock                  = SearchClock;
+
+    // Exact 64x64 cross product for ordering guidance costs. MSVC has no native
+    // 128-bit integer, so fall back to a high/low decomposition there.
+#if defined(__SIZEOF_INT128__)
+    using ExactProduct = __uint128_t;
+#else
+    struct ExactProduct {
+        std::uint64_t lo = 0;
+        std::uint64_t hi = 0;
+
+        constexpr explicit ExactProduct(std::uint64_t value) : lo(value) {}
+        constexpr ExactProduct(std::uint64_t low, std::uint64_t high) : lo(low), hi(high) {}
+
+        [[nodiscard]] friend constexpr ExactProduct operator*(ExactProduct x,
+                                                              std::uint64_t m) noexcept {
+            constexpr std::uint64_t M32 = 0xFFFFFFFFULL;
+            const std::uint64_t x0 = x.lo & M32, x1 = x.lo >> 32;
+            const std::uint64_t m0 = m & M32, m1 = m >> 32;
+            const std::uint64_t p0 = x0 * m0;
+            const std::uint64_t p1 = x1 * m0;
+            const std::uint64_t p2 = x0 * m1;
+            const std::uint64_t p3 = x1 * m1;
+            const std::uint64_t s  = (p1 & M32) + (p2 & M32);
+            const std::uint64_t lo = (s << 32) + p0;
+            const std::uint64_t hi = p3 + (p1 >> 32) + (p2 >> 32) + (s >> 32) + (lo < p0);
+            return ExactProduct(lo, hi);
+        }
+
+        [[nodiscard]] friend constexpr bool operator==(ExactProduct a,
+                                                       ExactProduct b) noexcept {
+            return a.hi == b.hi && a.lo == b.lo;
+        }
+
+        [[nodiscard]] friend constexpr bool operator!=(ExactProduct a,
+                                                       ExactProduct b) noexcept {
+            return !(a == b);
+        }
+
+        [[nodiscard]] friend constexpr bool operator<(ExactProduct a, ExactProduct b) noexcept {
+            return a.hi != b.hi ? a.hi < b.hi : a.lo < b.lo;
+        }
+    };
+#endif
 
     struct CandidateInput {
         AdmissionCandidate* candidate = nullptr;
@@ -924,8 +971,8 @@ private:
                            ? item.estimated_total_ns - parent.estimated_total_ns
                            : 0;
             };
-            const __uint128_t left  = static_cast<__uint128_t>(delta(cost)) * b;
-            const __uint128_t right = static_cast<__uint128_t>(delta(prior)) * a;
+            const ExactProduct left  = static_cast<ExactProduct>(delta(cost)) * b;
+            const ExactProduct right = static_cast<ExactProduct>(delta(prior)) * a;
             if (left != right) { return left < right; }
         }
         return cost.key() < prior.key();
