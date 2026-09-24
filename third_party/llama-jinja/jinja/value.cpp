@@ -278,7 +278,6 @@ const func_builtins& global_builtins() {
 #endif
                  throw raised_exception("strftime_now: invalid time");
              }
-#endif
              if (format.empty()) return mk_val<value_string>("");
              for (size_t capacity = 128; capacity <= 65536; capacity *= 2) {
                  std::string buffer(capacity, '\0');
